@@ -1,0 +1,11 @@
+{
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.1",
+    "@supabase/supabase-js": "^2.49.8",
+    "cohere-ai": "^7.17.1",
+    "google-auth-library": "^9.15.1",
+    "googleapis": "^149.0.0",
+    "openai": "^5.0.1",
+    "uuid": "^11.1.0"
+  }
+}
