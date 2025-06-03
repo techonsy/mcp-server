@@ -13,28 +13,31 @@ import { OpenAI } from "openai";
 import { v4 as uuidv4 } from 'uuid';
 import { google } from 'googleapis';
 import { OAuth2Client } from 'google-auth-library';
+ import * as dotenv from 'dotenv';
+console.log('Loading environment variables from .env file');
+dotenv.config();
 
 // Initialize Supabase client
 const supabase = createClient(
-    process.env.NEXT_PUBLIC_SUPABASE_URL || '',
-   process.env.SUPABASE_SERVICE_ROLE_KEY || ''
+    process.env.SUPABASE_URL || '',
+    process.env.SUPABASE_SERVICE_ROLE_KEY || ''
 );
-
+const defaultDate = new Date().toISOString().split('T')[0]; 
 // Initialize Cohere client
 const cohere = new CohereClient({
-  token: process.env.COHERE_API_KEY,
+  token: process.env.COHERE_API_KEY || '',
 });
 
 // Initialize OpenAI client
 const openai = new OpenAI({
-  baseURL:"https://openrouter.ai/api/v1",
-  apiKey:process.env.OPENROUTER_API_KEY,
+  baseURL: "https://openrouter.ai/api/v1",
+  apiKey: process.env.OPENROUTER_API_KEY || '',
 });
 
 // Google Calendar configuration
 const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || '';
 const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET || '';
-const GOOGLE_REDIRECT_URI = process.env.GOOGLE_REDIRECT_URI || 'http://localhost:3000/auth/callback';
+const GOOGLE_REDIRECT_URI = process.env.GOOGLE_REDIRECT_URI || '';
 
 // Keep your existing interfaces
 interface Message {
@@ -216,17 +219,55 @@ async function checkCalendarEligibility(userId: string): Promise<{
   }
 }
 
-async function createCalendarEvent(calendar: any, task: Task): Promise<string | null> {
+async function createCalendarEvent(calendar: any, task: Task,receiverId:string): Promise<string | null> {
   try {
-    const startDateTime = task.start_date && task.start_time 
-      ? new Date(`${task.start_date}T${task.start_time}`)
-      : task.due_date 
-        ? new Date(task.due_date)
-        : new Date();
+    // Skip calendar event creation if no meaningful date/time info
+    if (!task.start_date && !task.due_date && !task.start_time) {
+      console.log('No date/time info for calendar event, skipping');
+      return null;
+    }
 
-    const endDateTime = task.start_date && task.end_time
-      ? new Date(`${task.start_date}T${task.end_time}`)
-      : new Date(startDateTime.getTime() + 60 * 60 * 1000); // Default 1 hour duration
+    // Helper function to convert timestamp to Date with better validation
+    const parseTimestamp = (date:any, time:any, fallback:any) => {
+      let baseDate;
+
+      if (date) {
+        baseDate = new Date(date);
+        if (isNaN(baseDate.getTime())) {
+          console.warn(`Invalid date: ${date}, using fallback`);
+          baseDate = fallback || new Date();
+        }
+      } else {
+        baseDate = fallback || new Date();
+      }
+
+      if (time && time !== 'null') {
+        const [hours, minutes] = time.split(':').map(Number);
+        if (!isNaN(hours) && !isNaN(minutes)) {
+          baseDate.setHours(hours, minutes, 0, 0);
+        }
+      }
+
+      return baseDate;
+    };
+
+    // Parse start and end times with validation
+    const startDateTime = parseTimestamp(
+      task.start_date || task.due_date || '',
+      task.start_time || '',
+      new Date() // fallback to now
+    );
+
+    const endDateTime = parseTimestamp(
+      task.start_date || task.due_date || '',
+      task.end_time || '',
+      new Date(startDateTime.getTime() + 60 * 60 * 1000) // Default 1 hour duration
+    );
+
+    // Ensure end time is after start time
+    if (endDateTime <= startDateTime) {
+      endDateTime.setTime(startDateTime.getTime() + 60 * 60 * 1000);
+    }
 
     const event = {
       summary: task.content,
@@ -248,29 +289,46 @@ async function createCalendarEvent(calendar: any, task: Task): Promise<string | 
       },
     };
 
+    console.log('Creating calendar event for receiver:', receiverId);
     const response = await calendar.events.insert({
       calendarId: 'primary',
       requestBody: event,
     });
 
+    console.log('Calendar event created successfully for receiver:', receiverId, response.data.id);
     return response.data.id;
   } catch (error) {
     console.error('Error creating calendar event:', error);
+    if (error) {
+      console.error('Calendar API error details:', error);
+    }
     return null;
   }
 }
 
+
+
+
 async function updateCalendarEvent(calendar: any, eventId: string, task: Task): Promise<boolean> {
   try {
-    const startDateTime = task.start_date && task.start_time 
-      ? new Date(`${task.start_date}T${task.start_time}`)
-      : task.due_date 
-        ? new Date(task.due_date)
-        : new Date();
+    // Helper function to convert timestamp to Date
+    const parseTimestamp = (timestamp: string | null, fallback?: Date): Date => {
+      if (timestamp) {
+        return new Date(timestamp);
+      }
+      return fallback || new Date();
+    };
 
-    const endDateTime = task.start_date && task.end_time
-      ? new Date(`${task.start_date}T${task.end_time}`)
-      : new Date(startDateTime.getTime() + 60 * 60 * 1000);
+    // Parse start and end times
+    const startDateTime = parseTimestamp(
+      task.start_time || null, 
+      task.due_date ? new Date(task.due_date) : new Date()
+    );
+    
+    const endDateTime = parseTimestamp(
+      task.end_time || null,
+      new Date(startDateTime.getTime() + 60 * 60 * 1000) // Default 1 hour duration
+    );
 
     const event = {
       summary: task.content,
@@ -374,92 +432,109 @@ async function findRecentTasks(senderId: string, receiverId: string, limit: numb
   }
 }
 
-// Enhanced processTaskMessage with calendar integration
-async function processTaskMessage(content: string, senderId: string, receiverId: string): Promise<any> {
+async function checkMessageRelevancy(messageContent: string, userId:string, threshold = 0.7) {
   try {
-    // Generate embedding for the message
-    const embedding = await generateEmbedding(content);
-    
-    // Get recent tasks for context (with embeddings)
-    const recentTasks = await findRecentTasks(senderId, receiverId);
-    
-    // Create a temporary message object for processing
-    const tempMessage: Message = {
-      id: uuidv4(),
-      content,
-      created_at: new Date().toISOString(),
-      embedding,
-      sender_id: senderId,
-      receiver_id: receiverId,
-      is_system: true
-    };
+    // Fetch recent messages for the user
+    const recentMessages = await findRecentTasks(userId, userId);
 
-    // Find relevant tasks for potential updates
-    const relevantTasks: TaskSimilarity[] = [];
-    for (const task of recentTasks.filter(t => t.status === 'pending')) {
-      const taskEmbedding = task.embedding && Array.isArray(task.embedding) ? task.embedding : [];
-      if (taskEmbedding.length === 0) continue;
-      const similarity = cosineSimilarity(embedding, taskEmbedding);
+    // Generate embedding for the current message
+    const currentEmbedding = await generateEmbedding(messageContent);
+
+    // Analyze the recent messages to find relevancy using embeddings
+    for (const msg of recentMessages) {
+      if (msg.embedding) {
+        const similarity = cosineSimilarity(currentEmbedding, msg.embedding);
+        if (similarity > threshold) {
+          return msg; // Return the relevant message
+        }
+      }
+    }
+
+    return null; // No relevancy found
+  } catch (error) {
+    console.error('Error checking message relevancy:', error);
+    return null;
+  }
+}
+
+
+// Enhanced processTaskMessage with calendar integration
+async function processTaskMessage(content: string, senderId: string, receiverId: string) {
+  try {
+    // First check if message is relevant to existing tasks
+    const relevantMessage = await checkMessageRelevancy(content, senderId);
+    
+    if (relevantMessage) {
+      // Process as update/complete/cancel for existing task
+      const taskExtraction = await extractTaskFromMessage(content, [], []);
       
-      if (similarity > 0.5) {
-        const reasons = [];
-        if (similarity > 0.7) reasons.push(`High semantic similarity (${(similarity * 100).toFixed(1)}%)`);
+      if (!taskExtraction) {
+        return { success: false, message: "No task action detected" };
+      }
+
+      // Validate we have a matched task ID for update/complete/cancel actions
+      if (['update', 'complete', 'cancel'].includes(taskExtraction.action)) {
+        if (!taskExtraction.matched_task_id && relevantMessage.id) {
+          taskExtraction.matched_task_id = relevantMessage.id;
+        }
         
-        const messageWords = content.toLowerCase().split(/\s+/);
-        const taskWords = (task.content + ' ' + task.description).toLowerCase().split(/\s+/);
-        const commonWords = messageWords.filter(word => 
-          word.length > 3 && taskWords.some(taskWord => taskWord.includes(word) || word.includes(taskWord))
+        if (!taskExtraction.matched_task_id) {
+          return { 
+            success: false, 
+            message: "No matching task found for update/complete/cancel action" 
+          };
+        }
+
+        return await executeTaskAction(
+          taskExtraction, 
+          senderId, 
+          receiverId, 
+          relevantMessage.id || ''
         );
-        if (commonWords.length > 0) reasons.push(`Common keywords: ${commonWords.join(', ')}`);
-        
-        relevantTasks.push({ task, similarity, reasons });
       }
     }
 
-    // Extract task using AI (enhanced with calendar fields)
-    const taskExtraction = await extractTaskFromMessage(content, recentTasks, relevantTasks);
+    // Process as new task creation
+    const taskExtraction = await extractTaskFromMessage(content, [], []);
     
-    let messageInserted = false;
-    if (taskExtraction && taskExtraction.action === 'create') {
-      const { error: messageError } = await supabase
-        .from('messages')
-        .insert([{
-          id: tempMessage.id,
-          content: tempMessage.content,
-          sender_id: tempMessage.sender_id,
-          receiver_id: tempMessage.receiver_id,
-          created_at: tempMessage.created_at,
-          embedding: tempMessage.embedding,
-          is_system: true
-        }]);
-      if (messageError) {
-        throw messageError;
-      }
-      messageInserted = true;
+    if (!taskExtraction || taskExtraction.action !== 'create') {
+      return { success: false, message: "No task creation detected" };
     }
 
-    if (taskExtraction) {
-      const result = await executeTaskAction(taskExtraction, senderId, receiverId, tempMessage.id);
-      return {
-        success: true,
-        action: taskExtraction.action,
-        task: taskExtraction.task,
-        confidence: taskExtraction.confidence,
-        result,
-        messageInserted
-      };
+    // Create message first to ensure referential integrity
+    const messageId = uuidv4();
+    const { error: messageError } = await supabase
+      .from('messages')
+      .insert({
+        id: messageId,
+        content,
+        sender_id: senderId,
+        receiver_id: receiverId,
+        created_at: new Date().toISOString(),
+        is_task_created: true
+      });
+
+    if (messageError) {
+      console.error('Failed to create message:', messageError);
+      throw messageError;
     }
-    
-    return {
-      success: false,
-      message: "No task action detected"
-    };
-    
+
+    // Now create the task with the valid message_id
+    const result = await executeTaskAction(
+      taskExtraction, 
+      senderId, 
+      receiverId, 
+      messageId
+    );
+
+    return result;
+
   } catch (error) {
     console.error('Error processing task message:', error);
-    return {
-      success: false,
-      error: error instanceof Error ? error.message : 'Unknown error occurred'
+    return { 
+      success: false, 
+      error: error instanceof Error ? error.message : 'Unknown error occurred',
+      details: error instanceof Error ? error.stack : undefined
     };
   }
 }
@@ -468,51 +543,76 @@ async function processTaskMessage(content: string, senderId: string, receiverId:
 async function extractTaskFromMessage(
   currentMessage: string,
   recentTasks: Task[] = [],
-  relevantTasks: TaskSimilarity[] = []
+  relevantTasks: TaskSimilarity[] = [],
 ): Promise<TaskExtraction | null> {
   try {
     const tasksContext = recentTasks.length > 0
-      ? recentTasks.map((task, i) => 
-          `Task ${i + 1} (ID: ${task.id}): "${task.content}" - Priority: ${task.priority}, Status: ${task.status}, Due: ${task.due_date || 'No deadline'}, Start: ${task.start_date || 'No start date'}`
-        ).join('\n')
+      ? recentTasks.map((task, i) =>
+          `Task ${i + 1} (ID: ${task.id}): "${task.content}" - Priority: ${task.priority}, Status: ${task.status}, Due: ${task.due_date || 'No deadline'}, Start: ${task.start_date || 'No start date'}`)
+        .join('\n')
       : "No recent tasks found.";
 
     const relevantTasksContext = relevantTasks.length > 0
-      ? relevantTasks.map((item, i) => 
-          `Relevant Task ${i + 1} (ID: ${item.task.id}, Similarity: ${(item.similarity * 100).toFixed(1)}%):\n           Content: "${item.task.content}"\n           Priority: ${item.task.priority}, Status: ${item.task.status}\n           Reasons: ${item.reasons.join(', ')}`
-        ).join('\n\n')
+      ? relevantTasks.map((item, i) =>
+          `Relevant Task ${i + 1} (ID: ${item.task.id}, Similarity: ${(item.similarity * 100).toFixed(1)}%):\nContent: "${item.task.content}"\nPriority: ${item.task.priority}, Status: ${item.task.status}\nReasons: ${item.reasons.join(', ')}`)
+        .join('\n\n')
       : "No relevant tasks found.";
 
     const currentDate = new Date().toISOString().split('T')[0];
+    const currentTime = new Date().toTimeString().slice(0, 5); // HH:MM format
 
     const completion = await openai.chat.completions.create({
-      model: "meta-llama/llama-3.3-8b-instruct:free",
+      model: "meta-llama/llama-3.1-8b-instruct:free",
       messages: [
         {
           role: "system",
-          content: `You are a task management AI with calendar integration. Analyze messages to determine: CREATE, UPDATE, COMPLETE, or CANCEL tasks with calendar events.
-          
+          content: `You are a task management AI. Analyze messages and extract task information.
+
+CRITICAL: Return ONLY valid JSON. No explanations, no extra text, no markdown.
+
 CURRENT DATE: ${currentDate}
+CURRENT TIME: ${currentTime}
+
+TASK DETECTION RULES:
+- Look for action words: do, make, create, schedule, plan, remind, complete, finish, cancel, update
+- Look for time indicators: today, tomorrow, next week, at 3pm, by Friday, etc.
+- Look for objects/goals: meeting, call, presentation, email, etc.
+
+DATE/TIME PARSING RULES:
+- "today" = ${currentDate}
+- "tomorrow" = ${new Date(Date.now() + 24*60*60*1000).toISOString().split('T')[0]}
+- "next week" = ${new Date(Date.now() + 7*24*60*60*1000).toISOString().split('T')[0]}
+- "at 3pm", "3:00", "15:00" = extract time in HH:MM format
+- "by Friday", "due Friday" = set as due_date
+- If no specific time mentioned but date is mentioned, use "09:00" as default start time
+- If start time but no end time, add 1 hour to start time for end time
+
+PRIORITY RULES:
+- "urgent", "asap", "immediately" = "urgent"
+- "important", "priority" = "high"
+- "when you can", "sometime" = "low"
+- Default = "medium"
 
 RESPONSE FORMAT (JSON only):
 {
-  "task": "task content",
+  "task": "extracted task description",
   "priority": "low|medium|high|urgent",
   "confidence": 0.0-1.0,
-  "description": "action description",
+  "description": "detailed description of what needs to be done",
   "due_date": "YYYY-MM-DD or null",
   "start_date": "YYYY-MM-DD or null",
   "start_time": "HH:MM or null",
   "end_time": "HH:MM or null",
   "action": "create|update|complete|cancel",
-  "matched_task_id": "task ID if updating/completing/canceling",
-  "update_fields": ["content", "priority", "due_date", "start_date", "start_time", "end_time", "status"]
+  "matched_task_id": "task_id or null",
+  "update_fields": []
 }
 
-Extract dates and times carefully. Look for:
-- Meeting times: "at 3pm", "from 2-4pm", "9:30 AM"
-- Date references: "tomorrow", "next Monday", "December 15th"
-- Duration hints: "1 hour meeting", "30 minute call"`
+EXAMPLES:
+- "Schedule a meeting tomorrow at 2pm" → start_date: tomorrow, start_time: "14:00", end_time: "15:00"
+- "Remind me to call John by Friday" → due_date: next Friday, task: "call John"
+- "I need to finish the report today" → due_date: today, task: "finish the report"
+- "Let's have lunch at noon" → start_date: today, start_time: "12:00", end_time: "13:00"`,
         },
         {
           role: "user",
@@ -524,46 +624,181 @@ ${tasksContext}
 RELEVANT TASKS:
 ${relevantTasksContext}
 
-Analyze and respond with JSON only.`
+Extract task information and return ONLY the JSON object:`,
         }
       ],
-      temperature: 0.2,
-      max_tokens: 800
+      temperature: 0.1,
+      max_tokens: 500
     });
 
-    const response = completion.choices[0]?.message?.content;
-    if (!response) return null;
-
-    const parsed = JSON.parse(response.trim()) as TaskExtraction;
-    
-    if (parsed.action === 'create' && (!parsed.task || parsed.task === 'null')) {
+    const responseContent = completion.choices[0]?.message?.content;
+    if (!responseContent) {
+      console.log('No response from LLM');
       return null;
     }
 
+    // Clean the response - remove any non-JSON content
+    let cleanedResponse = responseContent.trim();
+
+    // Extract JSON if wrapped in code blocks
+    const jsonMatch = cleanedResponse.match(/```(?:\:json)?\s*(\{[\s\S]*\})\s*```/);
+    if (jsonMatch) {
+      cleanedResponse = jsonMatch[1];
+    }
+
+    // Find the JSON object if there's extra text
+    const jsonStart = cleanedResponse.indexOf('{');
+    const jsonEnd = cleanedResponse.lastIndexOf('}');
+    if (jsonStart !== -1 && jsonEnd !== -1 && jsonEnd > jsonStart) {
+      cleanedResponse = cleanedResponse.substring(jsonStart, jsonEnd + 1);
+    }
+
+    console.log('Cleaned LLM response:', cleanedResponse);
+
+    let parsed: TaskExtraction;
+    try {
+      parsed = JSON.parse(cleanedResponse);
+    } catch (parseError) {
+      console.error('JSON parse error:', parseError);
+      console.error('Failed to parse:', cleanedResponse);
+
+      // Return a default "no task detected" response
+      return {
+        task: '',
+        priority: "low",
+        confidence: 0.0,
+        description: "No task action detected",
+        due_date: null,
+        start_date: null,
+        start_time: null,
+        end_time: null,
+        action: "create",
+        matched_task_id: '',
+        update_fields: []
+      };
+    }
+
+    // Post-process and validate the parsed result
+    if (!parsed.action || !['create', 'update', 'complete', 'cancel'].includes(parsed.action)) {
+      console.error('Invalid action:', parsed.action);
+      return null;
+    }
+
+    if (parsed.action === 'create' && (!parsed.task || parsed.task === 'null' || parsed.task === null)) {
+      console.log('No task content for create action');
+      return null;
+    }
+
+    // Clean up null strings
+    if (parsed.due_date === 'null' || parsed.due_date === '') parsed.due_date = null;
+    if (parsed.start_date === 'null' || parsed.start_date === '') parsed.start_date = null;
+    if (parsed.start_time === 'null' || parsed.start_time === '') parsed.start_time = null;
+    if (parsed.end_time === 'null' || parsed.end_time === '') parsed.end_time = null;
+
+    // Auto-assign matched_task_id for update/complete/cancel if not provided
     if (['update', 'complete', 'cancel'].includes(parsed.action) && !parsed.matched_task_id && relevantTasks.length > 0) {
       parsed.matched_task_id = relevantTasks[0].task.id;
+      console.log(`Auto-assigned matched_task_id: ${parsed.matched_task_id}`);
     }
+
+    // Ensure confidence is a number
+    if (typeof parsed.confidence !== 'number') {
+      parsed.confidence = 0.5;
+    }
+
+    // If we have date/time info, ensure start_date is set for calendar creation
+    if ((parsed.start_time || parsed.end_time) && !parsed.start_date) {
+      parsed.start_date = parsed.due_date || currentDate;
+    }
+
+    console.log('Task processing result:', {
+      success: true,
+      action: parsed.action,
+      task: parsed.task,
+      confidence: parsed.confidence,
+      dates: {
+        due_date: parsed.due_date,
+        start_date: parsed.start_date,
+        start_time: parsed.start_time,
+        end_time: parsed.end_time
+      }
+    });
 
     return parsed;
   } catch (error) {
     console.error('Error extracting task:', error);
-    return null;
+
+    // Return a safe default instead of null
+    return {
+      task: '',
+      priority: "low",
+      confidence: 0.0,
+      description: "Error processing message",
+      due_date: null,
+      start_date: null,
+      start_time: null,
+      end_time: null,
+      action: "create",
+      matched_task_id: '',
+      update_fields: []
+    };
   }
 }
 
-// Enhanced executeTaskAction with calendar integration
+
+
+
+// Enhanced executeTaskAction with proper timestamp handling
 async function executeTaskAction(extraction: TaskExtraction, senderId: string, receiverId: string, messageId: string): Promise<any> {
   try {
+
+    if (messageId) {
+      const { data: message, error: messageError } = await supabase
+        .from('messages')
+        .select('id')
+        .eq('id', messageId)
+        .single();
+
+      if (messageError || !message) {
+        console.warn(`Message ${messageId} not found, proceeding without message reference`);
+        messageId = ''; // Clear the invalid message_id
+      }
+    }
+
+    const defaultDate = new Date().toISOString().split('T')[0]; // Get today's date in YYYY-MM-DD format
+
+    // Helper function to format time properly for PostgreSQL timestamp
+    function formatTimestamp(date: string | null, time: string | null): string | null {
+      if (!date && !time) return null;
+      
+      // Use provided date or default to today
+      const dateStr = date || defaultDate;
+      
+      // Handle time formatting
+      let timeStr = '00:00:00';
+      if (time && time !== 'null') {
+        // If time is in HH:MM format, add seconds
+        if (time.match(/^\d{1,2}:\d{2}$/)) {
+          timeStr = `${time}:00`;
+        } else if (time.match(/^\d{1,2}:\d{2}:\d{2}$/)) {
+          timeStr = time;
+        }
+      }
+      
+      // Return full ISO timestamp
+      return new Date(`${dateStr}T${timeStr}`).toISOString();
+    }
+
     switch (extraction.action) {
       case 'create':
         // Generate embedding for the new task
         const newTaskText = [extraction.task, extraction.description].filter(Boolean).join(' ');
         const newTaskEmbedding = await generateEmbedding(newTaskText);
 
+        // Format timestamps properly
         const dueDate = extraction.due_date === 'null' ? null : extraction.due_date;
-        const startDate = extraction.start_date === 'null' ? null : extraction.start_date;
-        const startTime = extraction.start_time === 'null' ? null : extraction.start_time;
-        const endTime = extraction.end_time === 'null' ? null : extraction.end_time;
+        const startTimestamp = formatTimestamp(extraction.start_date, extraction.start_time);
+        const endTimestamp = formatTimestamp(extraction.start_date, extraction.end_time);
 
         const newTask: Task = {
           content: extraction.task,
@@ -576,9 +811,9 @@ async function executeTaskAction(extraction: TaskExtraction, senderId: string, r
           status: 'pending',
           created_at: new Date().toISOString(),
           due_date: dueDate,
-          start_date: startDate,
-          start_time: startTime,
-          end_time: endTime,
+          start_date: extraction.start_date === 'null' ? null : extraction.start_date,
+          start_time: startTimestamp, // Now properly formatted as full timestamp
+          end_time: endTimestamp,     // Now properly formatted as full timestamp
           embedding: newTaskEmbedding
         };
 
@@ -593,8 +828,8 @@ async function executeTaskAction(extraction: TaskExtraction, senderId: string, r
         // Create calendar event
         let calendarEventId = null;
         try {
-          const calendar = await getGoogleCalendarClient(senderId);
-          calendarEventId = await createCalendarEvent(calendar, createdTask);
+          const calendar = await getGoogleCalendarClient(receiverId);
+          calendarEventId = await createCalendarEvent(calendar, createdTask,receiverId);
 
           if (calendarEventId) {
             await supabase
@@ -630,10 +865,10 @@ async function executeTaskAction(extraction: TaskExtraction, senderId: string, r
           updates.start_date = extraction.start_date === 'null' ? null : extraction.start_date;
         }
         if (extraction.update_fields?.includes('start_time')) {
-          updates.start_time = extraction.start_time === 'null' ? null : extraction.start_time;
+          updates.start_time = formatTimestamp(extraction.start_date, extraction.start_time);
         }
         if (extraction.update_fields?.includes('end_time')) {
-          updates.end_time = extraction.end_time === 'null' ? null : extraction.end_time;
+          updates.end_time = formatTimestamp(extraction.start_date, extraction.end_time);
         }
 
         if (shouldUpdateEmbedding) {
@@ -664,7 +899,6 @@ async function executeTaskAction(extraction: TaskExtraction, senderId: string, r
 
       case 'complete':
         if (!extraction.matched_task_id) {
-          // Handle the case where no task ID is provided for completion
           throw new Error('No task ID for completion');
         }
 
@@ -681,7 +915,6 @@ async function executeTaskAction(extraction: TaskExtraction, senderId: string, r
         try {
           if (completedTask.calendar_event_id) {
             const calendar = await getGoogleCalendarClient(senderId);
-            // You can either delete the event or update its title to show completion
             await updateCalendarEvent(calendar, completedTask.calendar_event_id, {
               ...completedTask,
               content: `✓ ${completedTask.content} (Completed)`
@@ -725,6 +958,7 @@ async function executeTaskAction(extraction: TaskExtraction, senderId: string, r
     throw error;
   }
 }
+
 
 
 // Create MCP Server
@@ -1035,39 +1269,46 @@ async function startBackgroundWorker() {
         table: 'messages'
       },
       async (payload) => {
-        console.error('Auto-processing new message with calendar integration');
         const message = payload.new as Message;
-        
-        // Skip system-inserted messages
-        if (message.is_system) {
-          console.error('Skipping system-inserted message.');
+
+        if (message.is_system || message.is_task_created) {
+          console.log('Skipping system/task-created message:', message.id);
           return;
         }
-        
+
+        console.log('New message received for processing:', message.id);
+
         // Check if a task already exists for this message
-        const { data: existingTasks, error } = await supabase
+        const { data: existingTasks, error: existingTaskError } = await supabase
           .from('tasks')
           .select('id')
           .eq('message_id', message.id)
           .limit(1);
 
-        if (error) {
-          console.error('Error checking for existing task:', error);
-          return;
-        }
-        
-        if (existingTasks && existingTasks.length > 0) {
-          console.error('Task already exists for this message, skipping.');
+        if (existingTaskError) {
+          console.error('Error checking for existing task:', existingTaskError);
           return;
         }
 
-        await processTaskMessage(message.content, message.sender_id, message.receiver_id);
+        if (existingTasks && existingTasks.length > 0) {
+          console.log('Task already exists for this message, skipping:', message.id);
+          return;
+        }
+
+        console.log('Processing message:', message.id);
+        try {
+          const result = await processTaskMessage(message.content, message.sender_id, message.receiver_id);
+          console.log('Task processing result:', result);
+        } catch (error) {
+          console.error('Error processing task message:', error);
+        }
       }
     )
     .subscribe();
 
-  console.error('Background subscription active with calendar integration');
+  console.log('Background subscription active with calendar integration');
 }
+
 
 main().catch((error) => {
   console.error('Server error:', error);
