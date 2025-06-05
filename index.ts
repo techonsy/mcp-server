@@ -219,7 +219,7 @@ async function checkCalendarEligibility(userId: string): Promise<{
   }
 }
 
-async function createCalendarEvent(calendar: any, task: Task,receiverId:string): Promise<string | null> {
+async function createCalendarEvent(calendar: any, task: Task, receiverId: string): Promise<string | null> {
   try {
     // Skip calendar event creation if no meaningful date/time info
     if (!task.start_date && !task.due_date && !task.start_time) {
@@ -228,45 +228,84 @@ async function createCalendarEvent(calendar: any, task: Task,receiverId:string):
     }
 
     // Helper function to convert timestamp to Date with better validation
-    const parseTimestamp = (date:any, time:any, fallback:any) => {
+    const parseTimestamp = (date: any, time: any, fallback: any) => {
       let baseDate;
-
-      if (date) {
+      
+      // Parse the date first
+      if (date && date !== 'null' && date !== null && date !== '') {
         baseDate = new Date(date);
         if (isNaN(baseDate.getTime())) {
           console.warn(`Invalid date: ${date}, using fallback`);
-          baseDate = fallback || new Date();
+          baseDate = new Date(fallback || new Date());
         }
       } else {
-        baseDate = fallback || new Date();
+        baseDate = new Date(fallback || new Date());
       }
 
-      if (time && time !== 'null') {
-        const [hours, minutes] = time.split(':').map(Number);
-        if (!isNaN(hours) && !isNaN(minutes)) {
-          baseDate.setHours(hours, minutes, 0, 0);
+      // Create a new date object to avoid modifying the original
+      const resultDate = new Date(baseDate);
+      
+      // Parse and set the time if provided
+      if (time && time !== 'null' && time !== null && time !== '') {
+        console.log(`Parsing time: ${time}`);
+        
+        // Handle different time formats
+        let hours, minutes;
+        
+        if (time.includes(':')) {
+          const timeParts = time.split(':');
+          hours = parseInt(timeParts[0], 10);
+          minutes = parseInt(timeParts[1], 10);
+        } else if (time.length === 4) {
+          // Handle HHMM format
+          hours = parseInt(time.substring(0, 2), 10);
+          minutes = parseInt(time.substring(2, 4), 10);
+        } else if (time.length <= 2) {
+          // Handle just hours
+          hours = parseInt(time, 10);
+          minutes = 0;
+        }
+        
+        if (typeof hours !== 'undefined' && typeof minutes !== 'undefined' && !isNaN(hours) && !isNaN(minutes) && hours >= 0 && hours <= 23 && minutes >= 0 && minutes <= 59) {
+          resultDate.setHours(hours, minutes, 0, 0);
+          console.log(`Set time to ${hours}:${minutes} on date ${resultDate.toISOString()}`);
+        } else {
+          console.warn(`Invalid time format: ${time}, hours: ${hours}, minutes: ${minutes}`);
         }
       }
-
-      return baseDate;
+      
+      return resultDate;
     };
+
+    console.log('Task data before parsing:', {
+      start_date: task.start_date,
+      due_date: task.due_date,
+      start_time: task.start_time,
+      end_time: task.end_time
+    });
 
     // Parse start and end times with validation
     const startDateTime = parseTimestamp(
-      task.start_date || task.due_date || '',
-      task.start_time || '',
+      task.start_date || task.due_date,
+      task.start_time,
       new Date() // fallback to now
     );
 
+    console.log('Parsed start time:', startDateTime.toISOString());
+
+    // For end time, use the same date but different time
     const endDateTime = parseTimestamp(
-      task.start_date || task.due_date || '',
-      task.end_time || '',
+      task.start_date || task.due_date,
+      task.end_time,
       new Date(startDateTime.getTime() + 60 * 60 * 1000) // Default 1 hour duration
     );
+
+    console.log('Parsed end time:', endDateTime.toISOString());
 
     // Ensure end time is after start time
     if (endDateTime <= startDateTime) {
       endDateTime.setTime(startDateTime.getTime() + 60 * 60 * 1000);
+      console.log('Adjusted end time to be 1 hour after start:', endDateTime.toISOString());
     }
 
     const event = {
@@ -289,7 +328,9 @@ async function createCalendarEvent(calendar: any, task: Task,receiverId:string):
       },
     };
 
+    console.log('Final event object:', JSON.stringify(event, null, 2));
     console.log('Creating calendar event for receiver:', receiverId);
+    
     const response = await calendar.events.insert({
       calendarId: 'primary',
       requestBody: event,
@@ -297,11 +338,9 @@ async function createCalendarEvent(calendar: any, task: Task,receiverId:string):
 
     console.log('Calendar event created successfully for receiver:', receiverId, response.data.id);
     return response.data.id;
+    
   } catch (error) {
     console.error('Error creating calendar event:', error);
-    if (error) {
-      console.error('Calendar API error details:', error);
-    }
     return null;
   }
 }

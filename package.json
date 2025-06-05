@@ -1,4 +1,8 @@
 {
+  "scripts": {
+    "start": "ts-node index.ts",
+    "build": "tsc"  
+  },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.12.1",
     "@supabase/supabase-js": "^2.49.8",
@@ -8,5 +12,8 @@
     "googleapis": "^149.0.0",
     "openai": "^5.0.1",
     "uuid": "^11.1.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.29"
   }
 }
