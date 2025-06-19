@@ -30,8 +30,7 @@ const cohere = new CohereClient({
 
 // Initialize OpenAI client
 const openai = new OpenAI({
-  baseURL: "https://openrouter.ai/api/v1",
-  apiKey: process.env.OPENROUTER_API_KEY || '',
+  apiKey: process.env.OPENAI_API_KEY|| '',
 });
 
 // Google Calendar configuration
@@ -583,205 +582,246 @@ async function extractTaskFromMessage(
   currentMessage: string,
   recentTasks: Task[] = [],
   relevantTasks: TaskSimilarity[] = [],
-): Promise<TaskExtraction | null> {
+): Promise<TaskExtraction> {
   try {
-    const tasksContext = recentTasks.length > 0
-      ? recentTasks.map((task, i) =>
-          `Task ${i + 1} (ID: ${task.id}): "${task.content}" - Priority: ${task.priority}, Status: ${task.status}, Due: ${task.due_date || 'No deadline'}, Start: ${task.start_date || 'No start date'}`)
-        .join('\n')
-      : "No recent tasks found.";
+    // Enhanced NLP preprocessing
+    const preprocessedMessage = await enhanceMessageUnderstanding(currentMessage);
 
-    const relevantTasksContext = relevantTasks.length > 0
-      ? relevantTasks.map((item, i) =>
-          `Relevant Task ${i + 1} (ID: ${item.task.id}, Similarity: ${(item.similarity * 100).toFixed(1)}%):\nContent: "${item.task.content}"\nPriority: ${item.task.priority}, Status: ${item.task.status}\nReasons: ${item.reasons.join(', ')}`)
-        .join('\n\n')
-      : "No relevant tasks found.";
+    // Build context with organizational awareness
+    const context = buildOrganizationalContext(recentTasks, relevantTasks);
 
-    const currentDate = new Date().toISOString().split('T')[0];
-    const currentTime = new Date().toTimeString().slice(0, 5); // HH:MM format
+    // Get current date/time for reference
+    const { currentDate, currentTime } = getCurrentDateTime();
 
-    const completion = await openai.chat.completions.create({
-      model: "meta-llama/llama-3.1-8b-instruct:free",
-      messages: [
-        {
-          role: "system",
-          content: `You are a task management AI. Analyze messages and extract task information.
+    // Call OpenAI with structured output
+    const extraction = await getStructuredTaskExtraction({
+      message: preprocessedMessage,
+      context,
+      currentDate,
+      currentTime,
+      relevantTasks
+    });
 
-CRITICAL: Return ONLY valid JSON. No explanations, no extra text, no markdown.
-
-CURRENT DATE: ${currentDate}
-CURRENT TIME: ${currentTime}
-
-TASK DETECTION RULES:
-- Look for action words: do, make, create, schedule, plan, remind, complete, finish, cancel, update
-- Look for time indicators: today, tomorrow, next week, at 3pm, by Friday, etc.
-- Look for objects/goals: meeting, call, presentation, email, etc.
-
-DATE/TIME PARSING RULES:
-- "today" = ${currentDate}
-- "tomorrow" = ${new Date(Date.now() + 24*60*60*1000).toISOString().split('T')[0]}
-- "next week" = ${new Date(Date.now() + 7*24*60*60*1000).toISOString().split('T')[0]}
-- "at 3pm", "3:00", "15:00" = extract time in HH:MM format
-- "by Friday", "due Friday" = set as due_date
-- If no specific time mentioned but date is mentioned, use "09:00" as default start time
-- If start time but no end time, add 1 hour to start time for end time
-
-PRIORITY RULES:
-- "urgent", "asap", "immediately" = "urgent"
-- "important", "priority" = "high"
-- "when you can", "sometime" = "low"
-- Default = "medium"
-
-RESPONSE FORMAT (JSON only):
-{
-  "task": "extracted task description",
-  "priority": "low|medium|high|urgent",
-  "confidence": 0.0-1.0,
-  "description": "detailed description of what needs to be done",
-  "due_date": "YYYY-MM-DD or null",
-  "start_date": "YYYY-MM-DD or null",
-  "start_time": "HH:MM or null",
-  "end_time": "HH:MM or null",
-  "action": "create|update|complete|cancel",
-  "matched_task_id": "task_id or null",
-  "update_fields": []
+    // Validate and normalize the response
+    return normalizeTaskExtraction(extraction, relevantTasks, currentDate);
+  } catch (error) {
+    console.error('Task extraction error:', error);
+    return getDefaultTaskExtraction('Error processing message');
+  }
 }
 
-EXAMPLES:
-- "Schedule a meeting tomorrow at 2pm" → start_date: tomorrow, start_time: "14:00", end_time: "15:00"
-- "Remind me to call John by Friday" → due_date: next Friday, task: "call John"
-- "I need to finish the report today" → due_date: today, task: "finish the report"
-- "Let's have lunch at noon" → start_date: today, start_time: "12:00", end_time: "13:00"`,
-        },
-        {
-          role: "user",
-          content: `MESSAGE: "${currentMessage}"
+// Helper functions
 
-RECENT TASKS:
-${tasksContext}
+async function enhanceMessageUnderstanding(message: string): Promise<string> {
+  // Step 1: Resolve organizational references
+  const withReferences = await resolveOrganizationalReferences(message);
+  
+  // Step 2: Clarify ambiguous terms
+  const clarified = await disambiguateTerms(withReferences);
+  
+  // Step 3: Normalize temporal expressions
+  const withNormalizedTime = await normalizeTemporalExpressions(clarified);
+  
+  return withNormalizedTime;
+}
 
-RELEVANT TASKS:
-${relevantTasksContext}
-
-Extract task information and return ONLY the JSON object:`,
-        }
-      ],
-      temperature: 0.1,
-      max_tokens: 500
+async function resolveOrganizationalReferences(message: string): Promise<string> {
+  try {
+    const response = await openai.chat.completions.create({
+      model: "gpt-4-turbo",
+      messages: [{
+        role: "system",
+        content: `Resolve all organizational references in this message:
+- Expand acronyms
+- Replace pronouns with proper nouns
+- Clarify department-specific terms
+Return only the clarified message.`
+      }, {
+        role: "user",
+        content: message
+      }],
+      temperature: 0
     });
-
-    const responseContent = completion.choices[0]?.message?.content;
-    if (!responseContent) {
-      console.log('No response from LLM');
-      return null;
-    }
-
-    // Clean the response - remove any non-JSON content
-    let cleanedResponse = responseContent.trim();
-
-    // Extract JSON if wrapped in code blocks
-    const jsonMatch = cleanedResponse.match(/```(?:\:json)?\s*(\{[\s\S]*\})\s*```/);
-    if (jsonMatch) {
-      cleanedResponse = jsonMatch[1];
-    }
-
-    // Find the JSON object if there's extra text
-    const jsonStart = cleanedResponse.indexOf('{');
-    const jsonEnd = cleanedResponse.lastIndexOf('}');
-    if (jsonStart !== -1 && jsonEnd !== -1 && jsonEnd > jsonStart) {
-      cleanedResponse = cleanedResponse.substring(jsonStart, jsonEnd + 1);
-    }
-
-    console.log('Cleaned LLM response:', cleanedResponse);
-
-    let parsed: TaskExtraction;
-    try {
-      parsed = JSON.parse(cleanedResponse);
-    } catch (parseError) {
-      console.error('JSON parse error:', parseError);
-      console.error('Failed to parse:', cleanedResponse);
-
-      // Return a default "no task detected" response
-      return {
-        task: '',
-        priority: "low",
-        confidence: 0.0,
-        description: "No task action detected",
-        due_date: null,
-        start_date: null,
-        start_time: null,
-        end_time: null,
-        action: "create",
-        matched_task_id: '',
-        update_fields: []
-      };
-    }
-
-    // Post-process and validate the parsed result
-    if (!parsed.action || !['create', 'update', 'complete', 'cancel'].includes(parsed.action)) {
-      console.error('Invalid action:', parsed.action);
-      return null;
-    }
-
-    if (parsed.action === 'create' && (!parsed.task || parsed.task === 'null' || parsed.task === null)) {
-      console.log('No task content for create action');
-      return null;
-    }
-
-    // Clean up null strings
-    if (parsed.due_date === 'null' || parsed.due_date === '') parsed.due_date = null;
-    if (parsed.start_date === 'null' || parsed.start_date === '') parsed.start_date = null;
-    if (parsed.start_time === 'null' || parsed.start_time === '') parsed.start_time = null;
-    if (parsed.end_time === 'null' || parsed.end_time === '') parsed.end_time = null;
-
-    // Auto-assign matched_task_id for update/complete/cancel if not provided
-    if (['update', 'complete', 'cancel'].includes(parsed.action) && !parsed.matched_task_id && relevantTasks.length > 0) {
-      parsed.matched_task_id = relevantTasks[0].task.id;
-      console.log(`Auto-assigned matched_task_id: ${parsed.matched_task_id}`);
-    }
-
-    // Ensure confidence is a number
-    if (typeof parsed.confidence !== 'number') {
-      parsed.confidence = 0.5;
-    }
-
-    // If we have date/time info, ensure start_date is set for calendar creation
-    if ((parsed.start_time || parsed.end_time) && !parsed.start_date) {
-      parsed.start_date = parsed.due_date || currentDate;
-    }
-
-    console.log('Task processing result:', {
-      success: true,
-      action: parsed.action,
-      task: parsed.task,
-      confidence: parsed.confidence,
-      dates: {
-        due_date: parsed.due_date,
-        start_date: parsed.start_date,
-        start_time: parsed.start_time,
-        end_time: parsed.end_time
-      }
-    });
-
-    return parsed;
-  } catch (error) {
-    console.error('Error extracting task:', error);
-
-    // Return a safe default instead of null
-    return {
-      task: '',
-      priority: "low",
-      confidence: 0.0,
-      description: "Error processing message",
-      due_date: null,
-      start_date: null,
-      start_time: null,
-      end_time: null,
-      action: "create",
-      matched_task_id: '',
-      update_fields: []
-    };
+    return response.choices[0]?.message?.content || message;
+  } catch {
+    return message;
   }
+}
+
+async function disambiguateTerms(message: string): Promise<string> {
+  try {
+    const response = await openai.chat.completions.create({
+      model: "gpt-3.5-turbo",
+      messages: [{
+        role: "system",
+        content: "Identify and disambiguate any potentially confusing terms in this organizational message. Return only the clarified message."
+      }, {
+        role: "user",
+        content: message
+      }],
+      temperature: 0
+    });
+    return response.choices[0]?.message?.content || message;
+  } catch {
+    return message;
+  }
+}
+
+async function normalizeTemporalExpressions(message: string): Promise<string> {
+  try {
+    const response = await openai.chat.completions.create({
+      model: "gpt-3.5-turbo",
+      messages: [{
+        role: "system",
+        content: `Normalize all time expressions in this message to unambiguous forms:
+- "next week" → "the week of [date]"
+- "EOQ" → "end of quarter (March 31/June 30/Sept 30/Dec 31)"
+- "tomorrow afternoon" → "tomorrow at 2pm"
+Return only the normalized message.`
+      }, {
+        role: "user",
+        content: message
+      }],
+      temperature: 0
+    });
+    return response.choices[0]?.message?.content || message;
+  } catch {
+    return message;
+  }
+}
+
+function buildOrganizationalContext(recentTasks: Task[], relevantTasks: TaskSimilarity[]): string {
+  const recentTasksText = recentTasks.length > 0
+    ? `RECENT TASKS:\n${recentTasks.map(task => 
+        `- ${task.content} [ID:${task.id}, Status:${task.status}, Due:${task.due_date || 'none'}]`
+      ).join('\n')}`
+    : 'No recent tasks';
+
+  const relevantTasksText = relevantTasks.length > 0
+    ? `RELEVANT TASKS:\n${relevantTasks.map(item =>
+        `- ${item.task.content} [ID:${item.task.id}, Match:${(item.similarity * 100).toFixed(0)}%, Reasons:${item.reasons.join('; ')}]`
+      ).join('\n')}`
+    : 'No relevant tasks';
+
+  return `${recentTasksText}\n\n${relevantTasksText}`;
+}
+
+function getCurrentDateTime(): { currentDate: string; currentTime: string } {
+  const now = new Date();
+  return {
+    currentDate: now.toISOString().split('T')[0],
+    currentTime: now.toTimeString().slice(0, 5)
+  };
+}
+
+async function getStructuredTaskExtraction(params: {
+  message: string;
+  context: string;
+  currentDate: string;
+  currentTime: string;
+  relevantTasks: TaskSimilarity[];
+}): Promise<Partial<TaskExtraction>> {
+  const response = await openai.chat.completions.create({
+    model: "gpt-4-turbo",
+    response_format: { type: "json_object" },
+    messages: [
+      {
+        role: "system",
+        content: `You are an organizational task extraction system. Analyze messages and return JSON with:
+- task: Clear action description
+- priority: Based on organizational standards
+- dates/times: Precisely normalized
+- action: create/update/complete/cancel
+- references: To existing tasks when applicable
+
+Current Date: ${params.currentDate}
+Current Time: ${params.currentTime}
+
+Response must match this exact JSON structure:
+{
+  "task": string,
+  "priority": "low"|"medium"|"high"|"urgent",
+  "confidence": number(0-1),
+  "description": string,
+  "due_date": string|null,
+  "start_date": string|null,
+  "start_time": string|null,
+  "end_time": string|null,
+  "action": "create"|"update"|"complete"|"cancel",
+  "existing_task_reference": string|null,
+  "matched_task_id": string|null,
+  "update_fields": string[]|null
+}`
+      },
+      {
+        role: "user",
+        content: `MESSAGE: ${params.message}\n\nCONTEXT:\n${params.context}`
+      }
+    ],
+    temperature: 0.2,
+    max_tokens: 1000
+  });
+
+  try {
+    return JSON.parse(response.choices[0]?.message?.content || '{}');
+  } catch {
+    return {};
+  }
+}
+
+function normalizeTaskExtraction(
+  extraction: Partial<TaskExtraction>,
+  relevantTasks: TaskSimilarity[],
+  currentDate: string
+): TaskExtraction {
+  // Apply defaults for required fields
+  const normalized: TaskExtraction = {
+    task: extraction.task || '',
+    priority: extraction.priority || 'medium',
+    confidence: Math.min(1, Math.max(0, extraction.confidence || 0.5)),
+    description: extraction.description || '',
+    due_date: extraction.due_date || null,
+    start_date: extraction.start_date || null,
+    start_time: extraction.start_time || null,
+    end_time: extraction.end_time || null,
+    action: extraction.action || 'create',
+    existing_task_reference: extraction.existing_task_reference || undefined,
+    matched_task_id: extraction.matched_task_id || undefined,
+    update_fields: extraction.update_fields || undefined
+  };
+
+  // Auto-match relevant tasks for update/complete/cancel actions
+  if (['update', 'complete', 'cancel'].includes(normalized.action) && 
+      !normalized.matched_task_id && 
+      relevantTasks.length > 0) {
+    normalized.matched_task_id = relevantTasks[0].task.id;
+  }
+
+  // Ensure temporal consistency
+  if ((normalized.start_time || normalized.end_time) && !normalized.start_date) {
+    normalized.start_date = normalized.due_date || currentDate;
+  }
+
+  // Clean empty strings
+  if (normalized.task.trim() === '') {
+    normalized.confidence = 0;
+  }
+
+  return normalized;
+}
+
+function getDefaultTaskExtraction(reason: string): TaskExtraction {
+  return {
+    task: '',
+    priority: 'medium',
+    confidence: 0,
+    description: reason,
+    due_date: null,
+    start_date: null,
+    start_time: null,
+    end_time: null,
+    action: 'create'
+  };
 }
 
 
