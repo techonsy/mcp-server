@@ -226,71 +226,54 @@ async function createCalendarEvent(calendar: any, task: Task, receiverId: string
       return null;
     }
 
-    // Improved timestamp parsing function
-    const parseTimestamp = (date: string | null | undefined, time: string | null | undefined, fallback: Date): Date => {
-      // If we have a full ISO datetime string, use that directly
-      if (time && time.includes('T') && time.includes(':')) {
-        try {
-          const dt = new Date(time);
-          if (!isNaN(dt.getTime())) return dt;
-        } catch (e) {
-          console.warn('Failed to parse full ISO datetime, falling back to components');
-        }
-      }
-
-      // Otherwise parse date and time components separately
-      let baseDate = fallback;
+    // Helper function to convert timestamp to Date with better validation
+    const parseTimestamp = (date: any, time: any, fallback: any) => {
+      let baseDate;
       
-      // Parse date component
+      // Parse the date first
       if (date && date !== 'null' && date !== null && date !== '') {
-        const dateOnly = date.split('T')[0]; // Extract just the date part if it's an ISO string
-        const d = new Date(dateOnly);
-        if (!isNaN(d.getTime())) {
-          baseDate = d;
-        } else {
+        baseDate = new Date(date);
+        if (isNaN(baseDate.getTime())) {
           console.warn(`Invalid date: ${date}, using fallback`);
+          baseDate = new Date(fallback || new Date());
         }
+      } else {
+        baseDate = new Date(fallback || new Date());
       }
 
-      // Parse time component if provided
+      // Create a new date object to avoid modifying the original
+      const resultDate = new Date(baseDate);
+      
+      // Parse and set the time if provided
       if (time && time !== 'null' && time !== null && time !== '') {
         console.log(`Parsing time: ${time}`);
         
-        // Extract just the time part if it's an ISO string
-        let timeStr = time;
-        if (time.includes('T')) {
-          const timeParts = time.split('T')[1]?.split('+')[0]?.split('-')[0];
-          if (timeParts) timeStr = timeParts;
-        }
-
-        let hours = 0, minutes = 0;
+        // Handle different time formats
+        let hours, minutes;
         
-        // Handle HH:MM:SS format
-        const timeParts = timeStr.split(':');
-        if (timeParts.length >= 2) {
+        if (time.includes(':')) {
+          const timeParts = time.split(':');
           hours = parseInt(timeParts[0], 10);
           minutes = parseInt(timeParts[1], 10);
+        } else if (time.length === 4) {
+          // Handle HHMM format
+          hours = parseInt(time.substring(0, 2), 10);
+          minutes = parseInt(time.substring(2, 4), 10);
+        } else if (time.length <= 2) {
+          // Handle just hours
+          hours = parseInt(time, 10);
+          minutes = 0;
         }
-        // Handle HHMM format
-        else if (timeStr.length === 4) {
-          hours = parseInt(timeStr.substring(0, 2), 10);
-          minutes = parseInt(timeStr.substring(2, 4), 10);
-        }
-        // Handle just hours
-        else if (timeStr.length <= 2) {
-          hours = parseInt(timeStr, 10);
-        }
-
-        // Validate and set time
-        if (!isNaN(hours) && !isNaN(minutes) && hours >= 0 && hours <= 23 && minutes >= 0 && minutes <= 59) {
-          baseDate.setHours(hours, minutes, 0, 0);
-          console.log(`Set time to ${hours}:${minutes} on date ${baseDate.toISOString()}`);
+        
+        if (typeof hours !== 'undefined' && typeof minutes !== 'undefined' && !isNaN(hours) && !isNaN(minutes) && hours >= 0 && hours <= 23 && minutes >= 0 && minutes <= 59) {
+          resultDate.setHours(hours, minutes, 0, 0);
+          console.log(`Set time to ${hours}:${minutes} on date ${resultDate.toISOString()}`);
         } else {
-          console.warn(`Invalid time values: hours=${hours}, minutes=${minutes}`);
+          console.warn(`Invalid time format: ${time}, hours: ${hours}, minutes: ${minutes}`);
         }
       }
       
-      return new Date(baseDate); // Return new instance to avoid reference issues
+      return resultDate;
     };
 
     console.log('Task data before parsing:', {
