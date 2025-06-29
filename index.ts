@@ -220,12 +220,10 @@ async function checkCalendarEligibility(userId: string): Promise<{
 
 async function createCalendarEvent(calendar: any, task: Task, receiverId: string): Promise<string | null> {
   try {
-    // Skip calendar event creation if no meaningful date/time info
-    if (!task.start_date && !task.due_date && !task.start_time) {
-      console.log('No date/time info for calendar event, skipping');
-      return null;
+    if (!task.start_date && !task.due_date) {
+      console.warn('No start or due date provided, using current date');
+      task.start_date = task.due_date = new Date().toISOString().split('T')[0];
     }
-
     // Helper function to convert timestamp to Date with better validation
     const parseTimestamp = (date: any, time: any, fallback: any) => {
       let baseDate;
@@ -628,7 +626,7 @@ async function enhanceMessageUnderstanding(message: string): Promise<string> {
 async function resolveOrganizationalReferences(message: string): Promise<string> {
   try {
     const response = await openai.chat.completions.create({
-      model: "gpt-4-turbo",
+      model: "gpt-4o",
       messages: [{
         role: "system",
         content: `Resolve all organizational references in this message:
@@ -722,7 +720,7 @@ async function getStructuredTaskExtraction(params: {
   relevantTasks: TaskSimilarity[];
 }): Promise<Partial<TaskExtraction>> {
   const response = await openai.chat.completions.create({
-    model: "gpt-4-turbo",
+    model: "gpt-4o",
     response_format: { type: "json_object" },
     messages: [
       {
